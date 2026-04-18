@@ -2,6 +2,7 @@
 #include <vector>
 #include <cstdlib>
 #include <ctime>
+#include <cctype>
 #include <GL/glew.h>
 #include <3dgl/3dgl.h>
 #include <GL/glut.h>
@@ -29,6 +30,10 @@ float accel = 4.f;
 vec3 _acc(0), _vel(0);
 float _fov = 60.f;
 
+// Window size
+int windowWidth = 1280;
+int windowHeight = 720;
+
 // ---------------- PARTICLE SYSTEM ----------------
 struct Particle
 {
@@ -46,6 +51,16 @@ GLuint particleShader = 0;
 
 const int MAX_PARTICLES = 400;
 vec3 emitterPos(15.0f, 2.0f, 0.0f);
+
+// ---------------- POST-PROCESSING ----------------
+GLuint postFBO = 0;
+GLuint postColorTex = 0;
+GLuint postDepthRBO = 0;
+
+GLuint postVAO = 0;
+GLuint postVBO = 0;
+GLuint postShader = 0;
+// -------------------------------------------------
 
 GLuint compileShader(GLenum type, const char* source)
 {
@@ -141,7 +156,8 @@ void initParticles()
 
 		void main()
 		{
-			FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+			float alpha = clamp(vLife, 0.0, 1.0);
+			FragColor = vec4(1.0, 0.7, 0.2, alpha);
 		}
 	)";
 
@@ -195,6 +211,8 @@ void updateParticles(float deltaTime)
 void renderParticles()
 {
 	glDisable(GL_LIGHTING);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
 	glUseProgram(particleShader);
 
@@ -207,9 +225,160 @@ void renderParticles()
 
 	glUseProgram(0);
 
+	glDisable(GL_BLEND);
 	glEnable(GL_LIGHTING);
 }
-// -------------------------------------------------
+
+// ---------------- POST-PROCESSING FUNCTIONS ----------------
+bool createPostProcessBuffers(int w, int h)
+{
+	if (postFBO == 0) glGenFramebuffers(1, &postFBO);
+	if (postColorTex == 0) glGenTextures(1, &postColorTex);
+	if (postDepthRBO == 0) glGenRenderbuffers(1, &postDepthRBO);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, postFBO);
+
+	glBindTexture(GL_TEXTURE_2D, postColorTex);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, postColorTex, 0);
+
+	glBindRenderbuffer(GL_RENDERBUFFER, postDepthRBO);
+	glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+	glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, postDepthRBO);
+
+	GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+	if (status != GL_FRAMEBUFFER_COMPLETE)
+	{
+		cout << "Framebuffer is not complete!" << endl;
+		return false;
+	}
+
+	return true;
+}
+
+bool initPostProcessing()
+{
+	const char* postVS = R"(
+		#version 330 core
+
+		layout(location = 0) in vec2 aPos;
+		layout(location = 1) in vec2 aTexCoord;
+
+		out vec2 vTexCoord;
+
+		void main()
+		{
+			vTexCoord = aTexCoord;
+			gl_Position = vec4(aPos, 0.0, 1.0);
+		}
+	)";
+
+	const char* postFS = R"(
+		#version 330 core
+
+		in vec2 vTexCoord;
+		out vec4 FragColor;
+
+		uniform sampler2D uScene;
+		uniform float uTime;
+
+		void main()
+		{
+			vec2 center = vec2(0.5, 0.5);
+			vec2 dir = vTexCoord - center;
+
+			// slight chromatic aberration
+			float aberration = 0.0035;
+			vec3 color;
+			color.r = texture(uScene, vTexCoord + dir * aberration).r;
+			color.g = texture(uScene, vTexCoord).g;
+			color.b = texture(uScene, vTexCoord - dir * aberration).b;
+
+			// cinematic contrast
+			color = (color - 0.5) * 1.15 + 0.5;
+
+			// slight warm tint
+			color *= vec3(1.05, 1.0, 0.95);
+
+			// vignette
+			float dist = distance(vTexCoord, center);
+			float vignette = 1.0 - smoothstep(0.30, 0.80, dist);
+			color *= vignette;
+
+			// subtle scanlines
+			float scanline = 0.985 + 0.015 * sin(vTexCoord.y * 900.0 + uTime * 2.0);
+			color *= scanline;
+
+			FragColor = vec4(color, 1.0);
+		}
+	)";
+
+	postShader = createShaderProgram(postVS, postFS);
+
+	float quadVertices[] =
+	{
+		// positions   // tex coords
+		-1.0f, -1.0f,  0.0f, 0.0f,
+		 1.0f, -1.0f,  1.0f, 0.0f,
+		 1.0f,  1.0f,  1.0f, 1.0f,
+
+		-1.0f, -1.0f,  0.0f, 0.0f,
+		 1.0f,  1.0f,  1.0f, 1.0f,
+		-1.0f,  1.0f,  0.0f, 1.0f
+	};
+
+	glGenVertexArrays(1, &postVAO);
+	glGenBuffers(1, &postVBO);
+
+	glBindVertexArray(postVAO);
+	glBindBuffer(GL_ARRAY_BUFFER, postVBO);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+	glEnableVertexAttribArray(0);
+
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+	glEnableVertexAttribArray(1);
+
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+
+	return createPostProcessBuffers(windowWidth, windowHeight);
+}
+
+void renderPostProcessedScene(float time)
+{
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glViewport(0, 0, windowWidth, windowHeight);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_LIGHTING);
+
+	glUseProgram(postShader);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, postColorTex);
+	glUniform1i(glGetUniformLocation(postShader, "uScene"), 0);
+	glUniform1f(glGetUniformLocation(postShader, "uTime"), time);
+
+	glBindVertexArray(postVAO);
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+	glBindVertexArray(0);
+
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
+
+	glEnable(GL_DEPTH_TEST);
+	glEnable(GL_LIGHTING);
+}
+// ------------------------------------------------------------
 
 bool init()
 {
@@ -232,6 +401,8 @@ bool init()
 
 	initParticles();
 
+	if (!initPostProcessing()) return false;
+
 	glClearColor(0.18f, 0.25f, 0.22f, 1.0f);
 
 	return true;
@@ -240,6 +411,14 @@ bool init()
 void renderScene(mat4& matrixView, float time, float deltaTime)
 {
 	mat4 m;
+
+	GLfloat lightPos[] = { 8.0f, 12.0f, 8.0f, 1.0f };
+	GLfloat lightDiffuse[] = { 1.0f, 1.0f, 1.0f, 1.0f };
+	GLfloat lightAmbient[] = { 0.2f, 0.2f, 0.2f, 1.0f };
+
+	glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
+	glLightfv(GL_LIGHT0, GL_DIFFUSE, lightDiffuse);
+	glLightfv(GL_LIGHT0, GL_AMBIENT, lightAmbient);
 
 	GLfloat rgbaGrey[] = { 0.6f, 0.6f, 0.6f, 1.0f };
 	glMaterialfv(GL_FRONT_AND_BACK, GL_DIFFUSE, rgbaGrey);
@@ -274,8 +453,6 @@ void onRender()
 	float deltaTime = time - prev;
 	prev = time;
 
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
 	_vel = clamp(_vel + _acc * deltaTime, -vec3(maxspeed), vec3(maxspeed));
 	float pitch = getPitch(matrixView);
 	matrixView = rotate(translate(rotate(mat4(1),
@@ -285,7 +462,16 @@ void onRender()
 		* matrixView;
 
 	updateParticles(deltaTime);
+
+	// 1) Render scene into framebuffer
+	glBindFramebuffer(GL_FRAMEBUFFER, postFBO);
+	glViewport(0, 0, windowWidth, windowHeight);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
 	renderScene(matrixView, time, deltaTime);
+
+	// 2) Render framebuffer texture to screen with post-process shader
+	renderPostProcessedScene(time);
 
 	glutSwapBuffers();
 	glutPostRedisplay();
@@ -293,6 +479,9 @@ void onRender()
 
 void onReshape(int w, int h)
 {
+	windowWidth = w;
+	windowHeight = h;
+
 	float ratio = w * 1.0f / h;
 	glViewport(0, 0, w, h);
 	matrixProjection = perspective(radians(_fov), ratio, 0.02f, 1000.f);
@@ -300,6 +489,8 @@ void onReshape(int w, int h)
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
 	glMultMatrixf((GLfloat*)&matrixProjection);
+
+	createPostProcessBuffers(w, h);
 }
 
 void onKeyDown(unsigned char key, int x, int y)
